@@ -72,9 +72,16 @@ func setupConfigDir(t *testing.T) string {
 	t.Helper()
 	prevInstallDir := app_specific.InstallDir
 	prevGlobalConfig := steampipeconfig.GlobalConfig
+	// NOTE: app_specific.ConfigExtension is only set by cmdconfig, which unit tests never run, so in
+	// the test binary it is empty - which makes the config include glob a bare "**/*" and pulls in
+	// files (default.spc.sample in particular) which the production glob "**/*.spc" never matches.
+	// Set it here so the test harness loads the same file set as production does.
+	prevExt := app_specific.ConfigExtension
 	app_specific.InstallDir = t.TempDir()
+	app_specific.ConfigExtension = ".spc"
 	t.Cleanup(func() {
 		app_specific.InstallDir = prevInstallDir
+		app_specific.ConfigExtension = prevExt
 		steampipeconfig.GlobalConfig = prevGlobalConfig
 	})
 	return pfilepaths.EnsureConfigDir()
@@ -144,11 +151,11 @@ connection "conn_good" {
 // skip the refresh and leave the previously loaded config in effect rather than tearing down every
 // connection.
 //
-// NOTE: this drives the error through a failure to bootstrap the config folder rather than through
-// "no config file parses". LoadConnectionConfig runs ensureDefaultConfigFile first, which
-// guarantees a parseable default.spc.sample in the real config dir, so a config folder in which
-// nothing parses is not reachable from here - that case is covered directly against loadConfig by
-// TestLoadConfig_AllFilesUnparseableReturnsError. Both reach this same branch of the watcher.
+// NOTE: this drives the watcher into that branch through a config folder BOOTSTRAP failure - the
+// default config file cannot be written because default.spc.sample already exists as a directory -
+// which is an infrastructure error rather than a parse error. The other route into the same branch,
+// where the folder is readable but every loadable .spc is unparseable, goes through the loadConfig
+// total-failure guard and is covered by TestHandleFileWatcherEvent_SkipsRefreshWhenNothingParses.
 func TestHandleFileWatcherEvent_SkipsRefreshWhenConfigCannotBeLoaded(t *testing.T) {
 	configDir := setupConfigDir(t)
 	writeSpcFile(t, configDir, "good.spc", `
@@ -184,6 +191,47 @@ connection "conn_good" {
 	select {
 	case <-refreshed:
 		t.Error("connections must not be refreshed when no config can be loaded")
+	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+// TestHandleFileWatcherEvent_SkipsRefreshWhenNothingParses covers the other route into the
+// skip-refresh branch: the config folder is perfectly readable, but every config file in it is
+// unparseable, so loadConfig's total-failure guard turns the load into a hard error. Unlike the
+// partial-config case there is nothing to refresh with, so the previously loaded config must stay
+// in effect and no refresh must be queued.
+func TestHandleFileWatcherEvent_SkipsRefreshWhenNothingParses(t *testing.T) {
+	configDir := setupConfigDir(t)
+	// the only config file in the folder is an unterminated block - nothing in here can parse
+	writeSpcFile(t, configDir, "broken.spc", `connection "x" {`)
+
+	previousConfig := steampipeconfig.NewSteampipeConfig("")
+	steampipeconfig.GlobalConfig = previousConfig
+
+	w, spy, refreshed := newTestWatcher(t)
+	w.handleFileWatcherEvent(nil)
+
+	// the notification must report a real error, raised by the total-failure guard specifically
+	select {
+	case ew := <-spy.notifications:
+		err := ew.GetError()
+		if err == nil {
+			t.Fatalf("a config folder in which nothing parses must be reported as an error, got warnings %v", ew.Warnings)
+		}
+		if !strings.Contains(err.Error(), "failed to parse any config file") {
+			t.Errorf("expected the total parse failure error, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected a notification describing the failure to parse any config file")
+	}
+
+	// the previously loaded config must still be in effect, and no refresh must have been queued
+	if steampipeconfig.GlobalConfig != previousConfig {
+		t.Error("the previously loaded config must remain in effect when nothing parses")
+	}
+	select {
+	case <-refreshed:
+		t.Error("connections must not be refreshed when nothing parses")
 	case <-time.After(250 * time.Millisecond):
 	}
 }
