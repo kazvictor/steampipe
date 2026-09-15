@@ -244,23 +244,48 @@ func loadConfig(ctx context.Context, configFolder string, steampipeConfig *Steam
 		return perror_helpers.ErrorAndWarnings{}
 	}
 
+	// NOTE: a file we cannot read is reported as a warning-severity diag - accumulate it and
+	// carry on with the files we could read
 	fileData, diags := pparse.LoadFileData(configPaths...)
-	if diags.HasErrors() {
-		log.Printf("[WARN] loadConfig: failed to load all config files: %v\n", err)
-		return perror_helpers.DiagsToErrorsAndWarnings("Failed to load all config files", diags)
+
+	// parse each file separately so that a syntax error in one file disables ONLY that file,
+	// rather than failing the load for the whole config folder.
+	// (parsing the folder in one call would also hide which file failed, and HCL returns a
+	// partially parsed file alongside its error diags, which we must not silently merge)
+	var bodies []hcl.Body
+	for _, configPath := range configPaths {
+		data, gotData := fileData[configPath]
+		if !gotData {
+			continue
+		}
+		fileBody, moreDiags := pparse.ParseHclFiles(map[string][]byte{configPath: data})
+		if moreDiags.HasErrors() {
+			// this file is unusable - disable its contents but keep the rest of the folder
+			diags = append(diags, demoteDiagsToWarnings(moreDiags)...)
+			continue
+		}
+		diags = append(diags, moreDiags...)
+		bodies = append(bodies, fileBody)
 	}
 
-	body, diags := pparse.ParseHclFiles(fileData)
-	if diags.HasErrors() {
-		return perror_helpers.DiagsToErrorsAndWarnings("Failed to load all config files", diags)
+	if len(bodies) == 0 {
+		// NOTE: nothing in the folder parsed, so there is no config to load at all. This remains a
+		// hard error: callers (and the connection watcher in particular) must be able to tell this
+		// apart from a partial load, so they can leave the previously loaded config in effect
+		// rather than tearing down every connection.
+		log.Printf("[WARN] loadConfig: failed to parse any config file in %s", configFolder)
+		res := perror_helpers.DiagsToErrorsAndWarnings("", diags)
+		res.Error = sperr.New("failed to parse any config file in %s", configFolder)
+		return res
 	}
+
+	body := hcl.MergeBodies(bodies)
 
 	// do a partial decode
+	// NOTE: content is always non-nil - a block which does not match the schema is reported and
+	// omitted from the content, so demote to a warning and carry on with what did decode
 	content, moreDiags := body.Content(pparse.SteampipeConfigBlockSchema)
-	if moreDiags.HasErrors() {
-		diags = append(diags, moreDiags...)
-		return perror_helpers.DiagsToErrorsAndWarnings("Failed to load config", diags)
-	}
+	diags = append(diags, demoteDiagsToWarnings(moreDiags)...)
 
 	// store block types which we have found in this folder - each is only allowed once
 	// NOTE this is different to merging options with options already populated in the passed-in steampipe config
@@ -272,22 +297,32 @@ func loadConfig(ctx context.Context, configFolder string, steampipeConfig *Steam
 
 		case schema.BlockTypePlugin:
 			plugin, moreDiags := parse.DecodePlugin(block)
-			diags = append(diags, moreDiags...)
 			if moreDiags.HasErrors() {
+				// a problem with a single plugin block must only disable that block
+				diags = append(diags, demoteDiagsToWarnings(moreDiags)...)
 				continue
 			}
+			diags = append(diags, moreDiags...)
 			// add plugin to steampipeConfig
-			// NOTE: this errors if there is a plugin block with a duplicate label
+			// NOTE: this errors if there is a plugin block with a duplicate label - keep the
+			// instance we already have, warn about the duplicate and carry on
 			if err := steampipeConfig.addPlugin(plugin); err != nil {
-				return perror_helpers.NewErrorsAndWarning(err)
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagWarning,
+					Summary:  err.Error(),
+					Subject:  hclhelpers.BlockRangePointer(block),
+				})
+				continue
 			}
 
 		case schema.BlockTypeConnection:
 			connection, moreDiags := pparse.DecodeConnection(block)
-			diags = append(diags, moreDiags...)
 			if moreDiags.HasErrors() {
+				// a problem with a single connection block must only disable that block
+				diags = append(diags, demoteDiagsToWarnings(moreDiags)...)
 				continue
 			}
+			diags = append(diags, moreDiags...)
 			// NOTE: a problem with a SINGLE connection must not fail the whole
 			// config load. LoadConnectionConfig re-parses the entire config
 			// folder, and the connection watcher aborts the refresh when it
@@ -316,12 +351,20 @@ func loadConfig(ctx context.Context, configFolder string, steampipeConfig *Steam
 
 		case schema.BlockTypeOptions:
 			// check this options type is permitted based on the options passed in
+			// NOTE: a duplicated or disallowed options block must only disable that block - keep
+			// the block we already have (if any), warn and carry on
 			if err := optionsBlockPermitted(block, optionBlockMap, opts); err != nil {
-				return perror_helpers.NewErrorsAndWarning(err)
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagWarning,
+					Summary:  err.Error(),
+					Subject:  hclhelpers.BlockRangePointer(block),
+				})
+				continue
 			}
 			opts, moreDiags := pparse.DecodeOptions(block, SteampipeOptionsBlockMapping)
 			if moreDiags.HasErrors() {
-				diags = append(diags, moreDiags...)
+				// a problem with a single options block must only disable that block
+				diags = append(diags, demoteDiagsToWarnings(moreDiags)...)
 				continue
 			}
 			// set options on steampipe config
@@ -346,6 +389,9 @@ func loadConfig(ctx context.Context, configFolder string, steampipeConfig *Steam
 		}
 	}
 
+	// NOTE: defensive backstop only - every KNOWN per-file and per-block failure is demoted to a
+	// warning above, so that one bad item disables only itself. Keep this guard so that any error
+	// diag we have not anticipated still fails loudly rather than silently loading a partial config.
 	if diags.HasErrors() {
 		return perror_helpers.DiagsToErrorsAndWarnings("Failed to load config", diags)
 	}
@@ -358,6 +404,24 @@ func loadConfig(ctx context.Context, configFolder string, steampipeConfig *Steam
 	// for all plugins mentioned in connection config which have no explicit config
 	steampipeConfig.initializePlugins()
 
+	return res
+}
+
+// demoteDiagsToWarnings returns a copy of diags with any error-severity diagnostic demoted to a
+// warning. It is used at every per-file and per-block failure point in loadConfig, so that a
+// problem with a single item is reported to the user but does not fail the whole config load.
+func demoteDiagsToWarnings(diags hcl.Diagnostics) hcl.Diagnostics {
+	res := make(hcl.Diagnostics, len(diags))
+	for i, d := range diags {
+		if d.Severity == hcl.DiagError {
+			// copy - the diags are owned by the parser and must not be mutated in place
+			demoted := *d
+			demoted.Severity = hcl.DiagWarning
+			res[i] = &demoted
+			continue
+		}
+		res[i] = d
+	}
 	return res
 }
 

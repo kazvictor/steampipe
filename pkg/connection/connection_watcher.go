@@ -19,11 +19,14 @@ type ConnectionWatcher struct {
 	watcher                 *filewatcher.FileWatcher
 	// interface exposing the plugin manager functions we need
 	pluginManager pluginManager
+	// the refresh function to call after a config change - a field so that it can be stubbed in tests
+	refreshConnectionsFunc func(context.Context, pluginManager, ...string) *steampipeconfig.RefreshConnectionResult
 }
 
 func NewConnectionWatcher(pluginManager pluginManager) (*ConnectionWatcher, error) {
 	w := &ConnectionWatcher{
-		pluginManager: pluginManager,
+		pluginManager:          pluginManager,
+		refreshConnectionsFunc: RefreshConnections,
 	}
 
 	configDir := filepaths.EnsureConfigDir()
@@ -74,20 +77,20 @@ func (w *ConnectionWatcher) handleFileWatcherEvent([]fsnotify.Event) {
 	// send notification if there were any errors or warnings
 	if !errorsAndWarnings.Empty() {
 		w.pluginManager.SendPostgresErrorsAndWarningsNotification(ctx, errorsAndWarnings)
-		// if there was an error return
+		// NOTE: a problem with a single file or a single block is reported as a warning and the
+		// offending item is skipped (see steampipeconfig.loadConfig) - we still refresh with
+		// everything which loaded successfully.
 		//
-		// NOTE: this aborts the refresh for EVERY connection, not just the one
-		// the config error relates to, and it will keep doing so on every
-		// subsequent file event for as long as the config folder fails to
-		// parse - so connections silently stop being created and credential
-		// updates stop being applied while the watcher itself keeps running.
-		// Log at ERROR level so this is visible at default log levels: it
-		// names the file to fix, and it is the only signal that syncing has
-		// stopped.
-		if errorsAndWarnings.GetError() != nil {
-			log.Printf("[ERROR] error loading updated connection config - NO connections will be refreshed until this is resolved: %v", errorsAndWarnings.GetError())
+		// We only get an ERROR here if NOTHING could be loaded at all, i.e. no config file in the
+		// folder parsed, or the config folder itself could not be read. There is no config to
+		// refresh with in that case, so we skip the refresh and the previously loaded config
+		// remains in effect. Log at ERROR level so this is visible at default log levels: it names
+		// what to fix, and it is the only signal that syncing has stopped.
+		if err := errorsAndWarnings.GetError(); err != nil {
+			log.Printf("[ERROR] failed to load any connection config - connections will NOT be refreshed and the previously loaded config remains in effect: %v", err)
 			return
 		}
+		log.Printf("[WARN] connection config loaded with %d warning(s) - refreshing connections with the config which loaded successfully", len(errorsAndWarnings.Warnings))
 	}
 
 	log.Printf("[INFO] loaded updated config")
@@ -127,7 +130,7 @@ func (w *ConnectionWatcher) handleFileWatcherEvent([]fsnotify.Event) {
 
 	// call RefreshConnections asyncronously
 	// the RefreshConnections implements its own locking to ensure only a single execution and a single queues execution
-	go RefreshConnections(ctx, w.pluginManager)
+	go w.refreshConnectionsFunc(ctx, w.pluginManager)
 
 	log.Printf("[TRACE] File watch event done")
 }
